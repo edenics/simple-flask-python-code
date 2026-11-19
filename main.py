@@ -14,6 +14,7 @@ Start: python main.py
 """
 
 import asyncio
+import datetime
 import hashlib
 import hmac
 import ipaddress
@@ -422,5 +423,10 @@ def build_app() -> web.Application:
 
 
 if __name__ == "__main__":
-    print(f"Starting Trojan-WS relay on 0.0.0.0:{PORT} (path {WS_PATH})", flush=True)
+    _ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(
+        f"[{_ts}] Starting Trojan-WS relay pid={os.getpid()} "
+        f"on 0.0.0.0:{PORT} (path {WS_PATH})",
+        flush=True,
+    )
     web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
