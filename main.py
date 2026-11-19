@@ -255,9 +255,7 @@ async def resolve_host(host: str) -> Optional[str]:
             ip = None
         ttl = DNS_CACHE_TTL if ip else DNS_NEG_TTL
         _dns_cache[host] = (time.monotonic() + ttl, ip)
-        if ip:
-            print(f"[dns] {host} -> {ip}", flush=True)
-        else:
+        if not ip:
             _stats["dns_failures"] += 1
             print(f"[dns] resolve failed: {host}", flush=True)
         if not fut.done():
@@ -353,7 +351,6 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                         break
 
                     _tune_socket(writer)
-                    print(f"[connect] {host}:{port}", flush=True)
                     initial = bytes(buffer[consumed:])
                     if initial:
                         _stats["bytes_up"] += len(initial)
