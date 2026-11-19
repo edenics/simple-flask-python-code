@@ -21,16 +21,19 @@ import struct
 import time
 from typing import Optional, Tuple
 
-from aiohttp import ClientSession, WSMsgType, web
+from aiohttp import ClientSession, TCPConnector, WSMsgType, web
 
 PASSWORD = os.environ.get("TROJAN_PASSWORD", "change-me-please-set-TROJAN_PASSWORD")
 WS_PATH = os.environ.get("PROXY_WS_PATH", "/trojan")
 PORT = int(os.environ.get("PORT", "8080"))
 CONNECT_TIMEOUT = 10
 DNS_SERVERS = ("8.8.8.8", "1.1.1.1")
+# Connect to literal IPs and set Host header so no DNS lookup of the endpoint
+# itself is needed (the platform resolver is broken). ssl=False because the
+# certificate is for the hostname, not the IP we dial.
 DOH_ENDPOINTS = (
-    "https://cloudflare-dns.com/dns-query",
-    "https://dns.google/resolve",
+    ("https://1.1.1.1/dns-query", "cloudflare-dns.com"),
+    ("https://8.8.8.8/resolve", "dns.google"),
 )
 DNS_CACHE_TTL = 300
 _dns_cache: dict = {}
@@ -141,14 +144,15 @@ async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
     return None
 
 
-async def _dns_query_doh(name: str, endpoint: str) -> Optional[str]:
-    """Resolve an A record via DNS-over-HTTPS (JSON API)."""
+async def _dns_query_doh(name: str, url: str, host: str) -> Optional[str]:
+    """Resolve an A record via DNS-over-HTTPS, dialing a literal IP (no DNS)."""
+    connector = TCPConnector(ssl=False)
     try:
-        async with ClientSession() as session:
+        async with ClientSession(connector=connector, trust_env=False) as session:
             async with session.get(
-                endpoint,
+                url,
                 params={"name": name, "type": "A"},
-                headers={"accept": "application/dns-json"},
+                headers={"accept": "application/dns-json", "Host": host},
                 timeout=8,
             ) as resp:
                 if resp.status != 200:
@@ -175,11 +179,11 @@ async def resolve_host(host: str) -> Optional[str]:
         return cached[1]
 
     # Primary: DoH over 443 (works when platform resolver / TCP 53 is broken)
-    for endpoint in DOH_ENDPOINTS:
-        ip = await _dns_query_doh(host, endpoint)
+    for url, doh_host in DOH_ENDPOINTS:
+        ip = await _dns_query_doh(host, url, doh_host)
         if ip:
             _dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, ip)
-            print(f"[dns] {host} -> {ip} via DoH {endpoint}", flush=True)
+            print(f"[dns] {host} -> {ip} via DoH {url}", flush=True)
             return ip
 
     # Fallback: DNS over TCP to public resolvers
