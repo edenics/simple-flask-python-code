@@ -28,6 +28,7 @@ from aiohttp import ClientSession, TCPConnector, WSMsgType, web
 PASSWORD = os.environ.get("TROJAN_PASSWORD", "change-me-please-set-TROJAN_PASSWORD")
 # Standard Trojan: password is SHA224(password) as 56 lowercase hex chars.
 PASSWORD_HEX = hashlib.sha224(PASSWORD.encode("utf-8")).hexdigest().encode("ascii")
+print(f"[init] password len={len(PASSWORD)} expected_hex_prefix={PASSWORD_HEX[:12].decode()}", flush=True)
 WS_PATH = os.environ.get("PROXY_WS_PATH", "/trojan")
 PORT = int(os.environ.get("PORT", "8080"))
 CONNECT_TIMEOUT = 10
@@ -86,6 +87,7 @@ def parse_trojan_handshake(data: bytes) -> Optional[Tuple[bool, str, int, int]]:
         return None
     supplied = data[:idx]
     if not hmac.compare_digest(supplied, PASSWORD_HEX):
+        print(f"[auth] wrong password: got_len={len(supplied)} got_prefix={supplied[:12]!r} expected_prefix={PASSWORD_HEX[:12]!r}", flush=True)
         raise ValueError("wrong password")
 
     rest = data[idx + 2 :]
