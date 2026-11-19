@@ -14,6 +14,8 @@ Start: python main.py
 """
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import os
 import socket
@@ -24,6 +26,8 @@ from typing import Optional, Tuple
 from aiohttp import ClientSession, TCPConnector, WSMsgType, web
 
 PASSWORD = os.environ.get("TROJAN_PASSWORD", "change-me-please-set-TROJAN_PASSWORD")
+# Standard Trojan: password is SHA224(password) as 56 lowercase hex chars.
+PASSWORD_HEX = hashlib.sha224(PASSWORD.encode("utf-8")).hexdigest().encode("ascii")
 WS_PATH = os.environ.get("PROXY_WS_PATH", "/trojan")
 PORT = int(os.environ.get("PORT", "8080"))
 CONNECT_TIMEOUT = 10
@@ -39,53 +43,70 @@ DNS_CACHE_TTL = 300
 _dns_cache: dict = {}
 
 
-def _parse_socks5(payload: bytes) -> Optional[Tuple[str, int, int]]:
-    """Parse a SOCKS5 CONNECT request. Return (host, port, bytes_consumed)."""
-    if len(payload) < 5:
+def _parse_socks5_addr(payload: bytes) -> Optional[Tuple[str, int, int]]:
+    """Parse a bare SOCKS5 address (ATYP + ADDR + PORT) used by Trojan.
+    Return (host, port, bytes_consumed)."""
+    if len(payload) < 1:
         return None
-    if payload[0] != 0x05 or payload[1] != 0x01 or payload[2] != 0x00:
-        raise ValueError("unsupported SOCKS5 request (only CONNECT is supported)")
-
-    atyp = payload[3]
+    atyp = payload[0]
     if atyp == 0x01:  # IPv4
-        if len(payload) < 10:
+        if len(payload) < 7:
             return None
-        host = socket.inet_ntoa(payload[4:8])
-        port = struct.unpack("!H", payload[8:10])[0]
-        return host, port, 10
+        host = socket.inet_ntoa(payload[1:5])
+        port = struct.unpack("!H", payload[5:7])[0]
+        return host, port, 7
     if atyp == 0x03:  # domain name
-        name_len = payload[4]
-        if len(payload) < 5 + name_len + 2:
+        if len(payload) < 2:
             return None
-        host = payload[5 : 5 + name_len].decode("ascii", "replace")
-        port = struct.unpack("!H", payload[5 + name_len : 7 + name_len])[0]
-        return host, port, 7 + name_len
+        name_len = payload[1]
+        if len(payload) < 2 + name_len + 2:
+            return None
+        host = payload[2 : 2 + name_len].decode("ascii", "replace")
+        port = struct.unpack("!H", payload[2 + name_len : 4 + name_len])[0]
+        return host, port, 2 + name_len + 2
     if atyp == 0x04:  # IPv6
-        if len(payload) < 22:
+        if len(payload) < 19:
             return None
-        host = socket.inet_ntop(socket.AF_INET6, payload[4:20])
-        port = struct.unpack("!H", payload[20:22])[0]
-        return host, port, 22
+        host = socket.inet_ntop(socket.AF_INET6, payload[1:17])
+        port = struct.unpack("!H", payload[17:19])[0]
+        return host, port, 19
     raise ValueError(f"unsupported SOCKS5 address type: {atyp}")
 
 
-def parse_trojan_handshake(data: bytes) -> Optional[Tuple[str, str, int, int]]:
-    """Parse 'password\\r\\n' + SOCKS5 CONNECT.
-
-    Returns (password, host, port, total_consumed), or None when more bytes
-    are needed. Raises ValueError on a malformed handshake.
+def parse_trojan_handshake(data: bytes) -> Optional[Tuple[bool, str, int, int]]:
+    """Parse a standard Trojan header:
+        <56-char hex password> CRLF <cmd:1 byte> <socks5 addr> CRLF
+    Returns (is_tcp, host, port, total_consumed), or None if more bytes needed.
+    Raises ValueError on a malformed handshake.
     """
     idx = data.find(b"\r\n")
     if idx < 0:
-        if len(data) > 4096:
-            raise ValueError("password line too long")
+        if len(data) > 128:
+            raise ValueError("trojan password line too long")
         return None
-    password = data[:idx].decode("utf-8", "replace")
-    parsed = _parse_socks5(data[idx + 2 :])
+    supplied = data[:idx]
+    if not hmac.compare_digest(supplied, PASSWORD_HEX):
+        raise ValueError("wrong password")
+
+    rest = data[idx + 2 :]
+    if len(rest) < 1:
+        return None
+    cmd = rest[0]
+    is_tcp = cmd == 0x01
+    if not is_tcp and cmd != 0x03:  # 1=TCP, 3=UDP
+        raise ValueError(f"unsupported trojan command: {cmd}")
+
+    parsed = _parse_socks5_addr(rest[1:])
     if parsed is None:
         return None
-    host, port, consumed = parsed
-    return password, host, port, idx + 2 + consumed
+    host, port, addr_len = parsed
+    consumed = idx + 2 + 1 + addr_len  # password + CRLF + cmd + addr
+    # trailing CRLF after the address
+    if len(data) < consumed + 2:
+        return None
+    if data[consumed : consumed + 2] != b"\r\n":
+        raise ValueError("missing CRLF after trojan address")
+    return is_tcp, host, port, consumed + 2
 
 
 def _dns_skip_name(data: bytes, offset: int) -> int:
@@ -232,9 +253,9 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                     if handshake is None:
                         continue
 
-                    password, host, port, consumed = handshake
-                    if password != PASSWORD:
-                        print("[auth] wrong password", flush=True)
+                    is_tcp, host, port, consumed = handshake
+                    if not is_tcp:
+                        print("[auth] UDP command not supported (tcp only)", flush=True)
                         break
 
                     connect_host = await resolve_host(host)
