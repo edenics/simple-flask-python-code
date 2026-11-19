@@ -1,8 +1,8 @@
 """Trojan-over-WebSocket relay for Clash.
 
-This app accepts a Trojan handshake inside a WebSocket connection and relays
-TCP traffic to the requested destination. It is intended for private use only:
-a password is required and the WebSocket path is fixed.
+Standard Trojan protocol inside a WebSocket connection; relays TCP traffic to
+the requested destination. Private use only: a password is required and the
+WebSocket path is fixed. UDP is not supported (Clash config: udp: false).
 
 Environment variables:
     TROJAN_PASSWORD   password used by Clash (change before deploying)
@@ -28,20 +28,38 @@ from aiohttp import ClientSession, TCPConnector, WSMsgType, web
 PASSWORD = os.environ.get("TROJAN_PASSWORD", "change-me-please-set-TROJAN_PASSWORD")
 # Standard Trojan: password is SHA224(password) as 56 lowercase hex chars.
 PASSWORD_HEX = hashlib.sha224(PASSWORD.encode("utf-8")).hexdigest().encode("ascii")
-print(f"[init] password len={len(PASSWORD)} expected_hex_prefix={PASSWORD_HEX[:12].decode()}", flush=True)
 WS_PATH = os.environ.get("PROXY_WS_PATH", "/trojan")
 PORT = int(os.environ.get("PORT", "8080"))
 CONNECT_TIMEOUT = 10
+MAX_HANDSHAKE = 4096
 DNS_SERVERS = ("8.8.8.8", "1.1.1.1")
-# Connect to literal IPs and set Host header so no DNS lookup of the endpoint
+# Connect to literal IPs with a Host header so no DNS lookup of the endpoint
 # itself is needed (the platform resolver is broken). ssl=False because the
-# certificate is for the hostname, not the IP we dial.
+# certificate is for the hostname, not the literal IP we dial.
 DOH_ENDPOINTS = (
     ("https://1.1.1.1/dns-query", "cloudflare-dns.com"),
     ("https://8.8.8.8/resolve", "dns.google"),
 )
 DNS_CACHE_TTL = 300
+DNS_NEG_TTL = 30
+
+# DNS cache: host -> (expiry_monotonic, ip_or_None). None is a negative result.
 _dns_cache: dict = {}
+# single-flight: host -> Future; concurrent lookups for one host share a result.
+_dns_inflight: dict = {}
+# Shared, connection-pooled session for DoH (avoid a TLS handshake per lookup).
+_doh_session: Optional[ClientSession] = None
+
+# Lightweight stats.
+_stats = {
+    "connections": 0,
+    "active": 0,
+    "dns_hits": 0,
+    "dns_lookups": 0,
+    "dns_failures": 0,
+    "bytes_up": 0,
+    "bytes_down": 0,
+}
 
 
 def _parse_socks5_addr(payload: bytes) -> Optional[Tuple[str, int, int]]:
@@ -82,12 +100,11 @@ def parse_trojan_handshake(data: bytes) -> Optional[Tuple[bool, str, int, int]]:
     """
     idx = data.find(b"\r\n")
     if idx < 0:
-        if len(data) > 128:
+        if len(data) > MAX_HANDSHAKE:
             raise ValueError("trojan password line too long")
         return None
     supplied = data[:idx]
     if not hmac.compare_digest(supplied, PASSWORD_HEX):
-        print(f"[auth] wrong password: got_len={len(supplied)} got_prefix={supplied[:12]!r} expected_prefix={PASSWORD_HEX[:12]!r}", flush=True)
         raise ValueError("wrong password")
 
     rest = data[idx + 2 :]
@@ -103,7 +120,6 @@ def parse_trojan_handshake(data: bytes) -> Optional[Tuple[bool, str, int, int]]:
         return None
     host, port, addr_len = parsed
     consumed = idx + 2 + 1 + addr_len  # password + CRLF + cmd + addr
-    # trailing CRLF after the address
     if len(data) < consumed + 2:
         return None
     if data[consumed : consumed + 2] != b"\r\n":
@@ -124,7 +140,7 @@ def _dns_skip_name(data: bytes, offset: int) -> int:
 
 
 async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
-    """Resolve an A record via DNS-over-TCP (platform resolver is unreliable)."""
+    """Resolve an A record via DNS-over-TCP (fallback)."""
     try:
         labels = [p.encode("ascii") for p in name.rstrip(".").split(".")]
         qname = b"".join(bytes([len(p)]) + p for p in labels) + b"\x00"
@@ -167,56 +183,113 @@ async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
     return None
 
 
+def _get_doh_session() -> ClientSession:
+    """Return the shared, connection-pooled DoH session (lazy init)."""
+    global _doh_session
+    if _doh_session is None or _doh_session.closed:
+        connector = TCPConnector(ssl=False, limit=20)
+        _doh_session = ClientSession(connector=connector, trust_env=False)
+    return _doh_session
+
+
 async def _dns_query_doh(name: str, url: str, host: str) -> Optional[str]:
     """Resolve an A record via DNS-over-HTTPS, dialing a literal IP (no DNS)."""
-    connector = TCPConnector(ssl=False)
     try:
-        async with ClientSession(connector=connector, trust_env=False) as session:
-            async with session.get(
-                url,
-                params={"name": name, "type": "A"},
-                headers={"accept": "application/dns-json", "Host": host},
-                timeout=8,
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-                for ans in data.get("Answer", []) or []:
-                    if ans.get("type") == 1 and ans.get("data"):
-                        return ans["data"]
+        session = _get_doh_session()
+        async with session.get(
+            url,
+            params={"name": name, "type": "A"},
+            headers={"accept": "application/dns-json", "Host": host},
+            timeout=8,
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+            for ans in data.get("Answer", []) or []:
+                if ans.get("type") == 1 and ans.get("data"):
+                    return ans["data"]
     except (OSError, ValueError, asyncio.TimeoutError, KeyError, TypeError):
         return None
     return None
 
 
+async def _resolve_uncached(host: str) -> Optional[str]:
+    """Actually resolve a domain (no single-flight). DoH first, TCP fallback."""
+    _stats["dns_lookups"] += 1
+    for url, doh_host in DOH_ENDPOINTS:
+        ip = await _dns_query_doh(host, url, doh_host)
+        if ip:
+            return ip
+    for server in DNS_SERVERS:
+        ip = await _dns_query_tcp(host, server)
+        if ip:
+            return ip
+    return None
+
+
 async def resolve_host(host: str) -> Optional[str]:
-    """Return an IP for host: cache -> DoH (443) -> DNS-over-TCP (53)."""
+    """Return an IP for host with caching + single-flight.
+
+    cache hit -> cached value (positive or negative) -> shared in-flight lookup.
+    """
     try:
         ipaddress.ip_address(host)
         return host
     except ValueError:
         pass
 
+    now = time.monotonic()
     cached = _dns_cache.get(host)
-    if cached and cached[0] > time.monotonic():
-        return cached[1]
+    if cached and cached[0] > now:
+        _stats["dns_hits"] += 1
+        return cached[1]  # may be None (negative cache)
 
-    # Primary: DoH over 443 (works when platform resolver / TCP 53 is broken)
-    for url, doh_host in DOH_ENDPOINTS:
-        ip = await _dns_query_doh(host, url, doh_host)
+    fut = _dns_inflight.get(host)
+    if fut is None:
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        _dns_inflight[host] = fut
+        try:
+            ip = await _resolve_uncached(host)
+        except Exception:
+            ip = None
+        ttl = DNS_CACHE_TTL if ip else DNS_NEG_TTL
+        _dns_cache[host] = (time.monotonic() + ttl, ip)
         if ip:
-            _dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, ip)
-            print(f"[dns] {host} -> {ip} via DoH {url}", flush=True)
-            return ip
+            print(f"[dns] {host} -> {ip}", flush=True)
+        else:
+            _stats["dns_failures"] += 1
+            print(f"[dns] resolve failed: {host}", flush=True)
+        if not fut.done():
+            fut.set_result(ip)
+        _dns_inflight.pop(host, None)
+        return ip
 
-    # Fallback: DNS over TCP to public resolvers
-    for server in DNS_SERVERS:
-        ip = await _dns_query_tcp(host, server)
-        if ip:
-            _dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, ip)
-            print(f"[dns] {host} -> {ip} via TCP {server}", flush=True)
-            return ip
-    return None
+    # Another coroutine is already resolving this host; wait for its result.
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        raise
+
+
+async def _safe_write(writer: asyncio.StreamWriter, data: bytes) -> bool:
+    """Write to upstream, swallowing connection errors. Returns success."""
+    try:
+        writer.write(data)
+        await writer.drain()
+        return True
+    except (ConnectionError, OSError, RuntimeError):
+        return False
+
+
+def _tune_socket(writer: asyncio.StreamWriter) -> None:
+    """Disable Nagle for lower latency on interactive traffic."""
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
 
 async def _pump_upstream(reader: asyncio.StreamReader, ws: web.WebSocketResponse) -> None:
@@ -225,11 +298,13 @@ async def _pump_upstream(reader: asyncio.StreamReader, ws: web.WebSocketResponse
             data = await reader.read(65536)
             if not data:
                 break
+            _stats["bytes_down"] += len(data)
             await ws.send_bytes(data)
-    except (ConnectionError, RuntimeError):
+    except (ConnectionError, RuntimeError, OSError):
         pass
     finally:
-        await ws.close()
+        if not ws.closed:
+            await ws.close()
 
 
 async def ws_relay(request: web.Request) -> web.WebSocketResponse:
@@ -239,6 +314,8 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
     buffer = bytearray()
     writer: Optional[asyncio.StreamWriter] = None
     pump_task: Optional[asyncio.Task] = None
+    _stats["connections"] += 1
+    _stats["active"] += 1
 
     try:
         async for msg in ws:
@@ -246,6 +323,9 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                 payload = msg.data.encode("utf-8") if isinstance(msg.data, str) else msg.data
 
                 if writer is None:
+                    if len(buffer) + len(payload) > MAX_HANDSHAKE:
+                        print("[auth] handshake too large", flush=True)
+                        break
                     buffer.extend(payload)
                     try:
                         handshake = parse_trojan_handshake(bytes(buffer))
@@ -262,7 +342,6 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
 
                     connect_host = await resolve_host(host)
                     if connect_host is None:
-                        print(f"[dns] resolve failed: {host}", flush=True)
                         break
 
                     try:
@@ -273,25 +352,29 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                         print(f"[connect] failed {host}({connect_host}):{port}: {exc}", flush=True)
                         break
 
+                    _tune_socket(writer)
                     print(f"[connect] {host}:{port}", flush=True)
                     initial = bytes(buffer[consumed:])
                     if initial:
-                        writer.write(initial)
-                        await writer.drain()
+                        _stats["bytes_up"] += len(initial)
+                        if not await _safe_write(writer, initial):
+                            break
                     pump_task = asyncio.create_task(_pump_upstream(reader, ws))
                 elif payload:
-                    writer.write(payload)
-                    await writer.drain()
+                    _stats["bytes_up"] += len(payload)
+                    if not await _safe_write(writer, payload):
+                        break
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
                 break
     finally:
+        _stats["active"] -= 1
         if pump_task is not None:
             pump_task.cancel()
         if writer is not None:
             writer.close()
             try:
                 await writer.wait_closed()
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 pass
         if not ws.closed:
             await ws.close()
@@ -309,11 +392,23 @@ async def health(_: web.Request) -> web.Response:
     return web.Response(text="OK", content_type="text/plain")
 
 
+async def stats(_: web.Request) -> web.Response:
+    return web.json_response(_stats)
+
+
+async def _cleanup(app: web.Application) -> None:
+    global _doh_session
+    if _doh_session is not None and not _doh_session.closed:
+        await _doh_session.close()
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
+    app.router.add_get("/stats", stats)
     app.router.add_get(WS_PATH, ws_relay)
+    app.on_cleanup.append(_cleanup)
     return app
 
 
