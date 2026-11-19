@@ -139,8 +139,8 @@ def _dns_skip_name(data: bytes, offset: int) -> int:
     return offset
 
 
-async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
-    """Resolve an A record via DNS-over-TCP (fallback)."""
+async def _dns_query_tcp(name: str, server: str) -> Optional[list]:
+    """Resolve A records via DNS-over-TCP (fallback). Returns list of IPs."""
     try:
         labels = [p.encode("ascii") for p in name.rstrip(".").split(".")]
         qname = b"".join(bytes([len(p)]) + p for p in labels) + b"\x00"
@@ -171,6 +171,7 @@ async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
     for _ in range(qdcount):
         offset = _dns_skip_name(response, offset)
         offset += 4
+    ips = []
     for _ in range(ancount):
         offset = _dns_skip_name(response, offset)
         if offset + 10 > len(response):
@@ -178,9 +179,9 @@ async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
         rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", response[offset : offset + 10])
         offset += 10
         if rtype == 1 and rclass == 1 and rdlength == 4:
-            return socket.inet_ntoa(response[offset : offset + 4])
+            ips.append(socket.inet_ntoa(response[offset : offset + 4]))
         offset += rdlength
-    return None
+    return ips or None
 
 
 def _get_doh_session() -> ClientSession:
@@ -192,8 +193,8 @@ def _get_doh_session() -> ClientSession:
     return _doh_session
 
 
-async def _dns_query_doh(name: str, url: str, host: str) -> Optional[str]:
-    """Resolve an A record via DNS-over-HTTPS, dialing a literal IP (no DNS)."""
+async def _dns_query_doh(name: str, url: str, host: str) -> Optional[list]:
+    """Resolve A records via DNS-over-HTTPS, dialing a literal IP (no DNS)."""
     try:
         session = _get_doh_session()
         async with session.get(
@@ -205,36 +206,43 @@ async def _dns_query_doh(name: str, url: str, host: str) -> Optional[str]:
             if resp.status != 200:
                 return None
             data = await resp.json(content_type=None)
-            for ans in data.get("Answer", []) or []:
-                if ans.get("type") == 1 and ans.get("data"):
-                    return ans["data"]
+            ips = [
+                ans["data"]
+                for ans in (data.get("Answer", []) or [])
+                if ans.get("type") == 1 and ans.get("data")
+            ]
+            return ips or None
     except (OSError, ValueError, asyncio.TimeoutError, KeyError, TypeError):
         return None
     return None
 
 
-async def _resolve_uncached(host: str) -> Optional[str]:
-    """Actually resolve a domain (no single-flight). DoH first, TCP fallback."""
+async def _resolve_uncached(host: str) -> Optional[list]:
+    """Actually resolve a domain (no single-flight). DoH first, TCP fallback.
+
+    Returns a list of IPs (all A records) or None.
+    """
     _stats["dns_lookups"] += 1
     for url, doh_host in DOH_ENDPOINTS:
-        ip = await _dns_query_doh(host, url, doh_host)
-        if ip:
-            return ip
+        ips = await _dns_query_doh(host, url, doh_host)
+        if ips:
+            return ips
     for server in DNS_SERVERS:
-        ip = await _dns_query_tcp(host, server)
-        if ip:
-            return ip
+        ips = await _dns_query_tcp(host, server)
+        if ips:
+            return ips
     return None
 
 
-async def resolve_host(host: str) -> Optional[str]:
-    """Return an IP for host with caching + single-flight.
+async def resolve_host(host: str) -> list:
+    """Return a list of IPs for host with caching + single-flight.
 
-    cache hit -> cached value (positive or negative) -> shared in-flight lookup.
+    Returns all A records so callers can fail over if one is unreachable.
+    Literal IPs are returned as a single-element list.
     """
     try:
         ipaddress.ip_address(host)
-        return host
+        return [host]
     except ValueError:
         pass
 
@@ -242,7 +250,7 @@ async def resolve_host(host: str) -> Optional[str]:
     cached = _dns_cache.get(host)
     if cached and cached[0] > now:
         _stats["dns_hits"] += 1
-        return cached[1]  # may be None (negative cache)
+        return cached[1] or []  # None (negative cache) -> []
 
     fut = _dns_inflight.get(host)
     if fut is None:
@@ -250,24 +258,22 @@ async def resolve_host(host: str) -> Optional[str]:
         fut = loop.create_future()
         _dns_inflight[host] = fut
         try:
-            ip = await _resolve_uncached(host)
+            ips = await _resolve_uncached(host)
         except Exception:
-            ip = None
-        ttl = DNS_CACHE_TTL if ip else DNS_NEG_TTL
-        _dns_cache[host] = (time.monotonic() + ttl, ip)
-        if not ip:
+            ips = None
+        ips = ips or []
+        ttl = DNS_CACHE_TTL if ips else DNS_NEG_TTL
+        _dns_cache[host] = (time.monotonic() + ttl, ips or None)
+        if not ips:
             _stats["dns_failures"] += 1
             print(f"[dns] resolve failed: {host}", flush=True)
         if not fut.done():
-            fut.set_result(ip)
+            fut.set_result(ips)
         _dns_inflight.pop(host, None)
-        return ip
+        return ips
 
     # Another coroutine is already resolving this host; wait for its result.
-    try:
-        return await asyncio.shield(fut)
-    except asyncio.CancelledError:
-        raise
+    return await asyncio.shield(fut)
 
 
 async def _safe_write(writer: asyncio.StreamWriter, data: bytes) -> bool:
@@ -338,16 +344,22 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                         print("[auth] UDP command not supported (tcp only)", flush=True)
                         break
 
-                    connect_host = await resolve_host(host)
-                    if connect_host is None:
+                    connect_ips = await resolve_host(host)
+                    if not connect_ips:
                         break
 
-                    try:
-                        reader, writer = await asyncio.wait_for(
-                            asyncio.open_connection(connect_host, port), CONNECT_TIMEOUT
-                        )
-                    except (OSError, asyncio.TimeoutError) as exc:
-                        print(f"[connect] failed {host}({connect_host}):{port}: {exc}", flush=True)
+                    # Fail over across all A records; only give up if all fail.
+                    for ip in connect_ips:
+                        try:
+                            reader, writer = await asyncio.wait_for(
+                                asyncio.open_connection(ip, port), CONNECT_TIMEOUT
+                            )
+                            break
+                        except (OSError, asyncio.TimeoutError) as exc:
+                            last_exc = exc
+                            continue
+                    else:
+                        print(f"[connect] failed {host} ({len(connect_ips)} IPs): {last_exc}", flush=True)
                         break
 
                     _tune_socket(writer)
