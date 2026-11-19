@@ -14,9 +14,11 @@ Start: python main.py
 """
 
 import asyncio
+import ipaddress
 import os
 import socket
 import struct
+import time
 from typing import Optional, Tuple
 
 from aiohttp import WSMsgType, web
@@ -25,6 +27,9 @@ PASSWORD = os.environ.get("TROJAN_PASSWORD", "change-me-please-set-TROJAN_PASSWO
 WS_PATH = os.environ.get("PROXY_WS_PATH", "/trojan")
 PORT = int(os.environ.get("PORT", "8080"))
 CONNECT_TIMEOUT = 10
+DNS_SERVERS = ("8.8.8.8", "1.1.1.1")
+DNS_CACHE_TTL = 300
+_dns_cache: dict = {}
 
 
 def _parse_socks5(payload: bytes) -> Optional[Tuple[str, int, int]]:
@@ -76,6 +81,83 @@ def parse_trojan_handshake(data: bytes) -> Optional[Tuple[str, str, int, int]]:
     return password, host, port, idx + 2 + consumed
 
 
+def _dns_skip_name(data: bytes, offset: int) -> int:
+    """Skip a DNS name (with compression pointers), return next offset."""
+    while offset < len(data):
+        length = data[offset]
+        if length & 0xC0 == 0xC0:
+            return offset + 2
+        if length == 0:
+            return offset + 1
+        offset += 1 + length
+    return offset
+
+
+async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
+    """Resolve an A record via DNS-over-TCP (platform resolver is unreliable)."""
+    try:
+        labels = [p.encode("ascii") for p in name.rstrip(".").split(".")]
+        qname = b"".join(bytes([len(p)]) + p for p in labels) + b"\x00"
+        question = qname + struct.pack("!HH", 1, 1)  # QTYPE=A, QCLASS=IN
+        header = struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+        message = header + question
+        packet = struct.pack("!H", len(message)) + message
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(server, 53), 5
+        )
+        try:
+            writer.write(packet)
+            await writer.drain()
+            raw_len = await asyncio.wait_for(reader.readexactly(2), 5)
+            length = struct.unpack("!H", raw_len)[0]
+            response = await asyncio.wait_for(reader.readexactly(length), 5)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return None
+
+    if len(response) < 12:
+        return None
+    qdcount, ancount = struct.unpack("!HH", response[4:8])
+    offset = 12
+    for _ in range(qdcount):
+        offset = _dns_skip_name(response, offset)
+        offset += 4
+    for _ in range(ancount):
+        offset = _dns_skip_name(response, offset)
+        if offset + 10 > len(response):
+            break
+        rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", response[offset : offset + 10])
+        offset += 10
+        if rtype == 1 and rclass == 1 and rdlength == 4:
+            return socket.inet_ntoa(response[offset : offset + 4])
+        offset += rdlength
+    return None
+
+
+async def resolve_host(host: str) -> Optional[str]:
+    """Return an IP for host; use cache then public DNS over TCP."""
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    cached = _dns_cache.get(host)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+
+    for server in DNS_SERVERS:
+        ip = await _dns_query_tcp(host, server)
+        if ip:
+            _dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, ip)
+            print(f"[dns] {host} -> {ip} via {server}", flush=True)
+            return ip
+    return None
+
+
 async def _pump_upstream(reader: asyncio.StreamReader, ws: web.WebSocketResponse) -> None:
     try:
         while True:
@@ -117,12 +199,17 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                         print("[auth] wrong password", flush=True)
                         break
 
+                    connect_host = await resolve_host(host)
+                    if connect_host is None:
+                        print(f"[dns] resolve failed: {host}", flush=True)
+                        break
+
                     try:
                         reader, writer = await asyncio.wait_for(
-                            asyncio.open_connection(host, port), CONNECT_TIMEOUT
+                            asyncio.open_connection(connect_host, port), CONNECT_TIMEOUT
                         )
                     except (OSError, asyncio.TimeoutError) as exc:
-                        print(f"[connect] failed {host}:{port}: {exc}", flush=True)
+                        print(f"[connect] failed {host}({connect_host}):{port}: {exc}", flush=True)
                         break
 
                     print(f"[connect] {host}:{port}", flush=True)
