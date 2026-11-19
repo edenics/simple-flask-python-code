@@ -57,7 +57,7 @@ def _parse_socks5(payload: bytes) -> Optional[Tuple[str, int, int]]:
         name_len = payload[4]
         if len(payload) < 5 + name_len + 2:
             return None
-        host = payload[5 : 5 + name_len].decode("idna", "replace")
+        host = payload[5 : 5 + name_len].decode("ascii", "replace")
         port = struct.unpack("!H", payload[5 + name_len : 7 + name_len])[0]
         return host, port, 7 + name_len
     if atyp == 0x04:  # IPv6
