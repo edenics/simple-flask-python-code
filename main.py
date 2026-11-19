@@ -21,13 +21,17 @@ import struct
 import time
 from typing import Optional, Tuple
 
-from aiohttp import WSMsgType, web
+from aiohttp import ClientSession, WSMsgType, web
 
 PASSWORD = os.environ.get("TROJAN_PASSWORD", "change-me-please-set-TROJAN_PASSWORD")
 WS_PATH = os.environ.get("PROXY_WS_PATH", "/trojan")
 PORT = int(os.environ.get("PORT", "8080"))
 CONNECT_TIMEOUT = 10
 DNS_SERVERS = ("8.8.8.8", "1.1.1.1")
+DOH_ENDPOINTS = (
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/resolve",
+)
 DNS_CACHE_TTL = 300
 _dns_cache: dict = {}
 
@@ -137,8 +141,29 @@ async def _dns_query_tcp(name: str, server: str) -> Optional[str]:
     return None
 
 
+async def _dns_query_doh(name: str, endpoint: str) -> Optional[str]:
+    """Resolve an A record via DNS-over-HTTPS (JSON API)."""
+    try:
+        async with ClientSession() as session:
+            async with session.get(
+                endpoint,
+                params={"name": name, "type": "A"},
+                headers={"accept": "application/dns-json"},
+                timeout=8,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                for ans in data.get("Answer", []) or []:
+                    if ans.get("type") == 1 and ans.get("data"):
+                        return ans["data"]
+    except (OSError, ValueError, asyncio.TimeoutError, KeyError, TypeError):
+        return None
+    return None
+
+
 async def resolve_host(host: str) -> Optional[str]:
-    """Return an IP for host; use cache then public DNS over TCP."""
+    """Return an IP for host: cache -> DoH (443) -> DNS-over-TCP (53)."""
     try:
         ipaddress.ip_address(host)
         return host
@@ -149,11 +174,20 @@ async def resolve_host(host: str) -> Optional[str]:
     if cached and cached[0] > time.monotonic():
         return cached[1]
 
+    # Primary: DoH over 443 (works when platform resolver / TCP 53 is broken)
+    for endpoint in DOH_ENDPOINTS:
+        ip = await _dns_query_doh(host, endpoint)
+        if ip:
+            _dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, ip)
+            print(f"[dns] {host} -> {ip} via DoH {endpoint}", flush=True)
+            return ip
+
+    # Fallback: DNS over TCP to public resolvers
     for server in DNS_SERVERS:
         ip = await _dns_query_tcp(host, server)
         if ip:
             _dns_cache[host] = (time.monotonic() + DNS_CACHE_TTL, ip)
-            print(f"[dns] {host} -> {ip} via {server}", flush=True)
+            print(f"[dns] {host} -> {ip} via TCP {server}", flush=True)
             return ip
     return None
 
